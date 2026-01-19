@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Seamless PCM Loop</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #f8f9fa;
+    }
+    h1 { color: #333; margin-bottom: 1rem; }
+    #status {
+      margin: 1rem 0;
+      padding: 0.75rem 1.5rem;
+      background: #e9ecef;
+      border-radius: 8px;
+      min-width: 300px;
+      text-align: center;
+    }
+    button {
+      padding: 0.75rem 2rem;
+      font-size: 1.1rem;
+      background: #28a745;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #218838; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>🔁 Seamless Audio Loop</h1>
+  <button id="playBtn">Play Audio</button>
+  <div id="status">Click to load and play</div>
+
+  <script>
+    let socket = null;
+    let audioContext = null;
+
+    document.getElementById('playBtn').onclick = async () => {
+      // Clean up previous
+      if (socket) {
+        socket.close();
+        socket = null;
+      }
+      if (audioContext) {
+        await audioContext.close();
+        audioContext = null;
+      }
+
+      const status = document.getElementById('status');
+      status.textContent = '⏳ Connecting...';
+
+      try {
+        // Create and resume AudioContext (required by browsers)
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+
+        // Connect WebSocket
+        socket = new WebSocket(`ws://${location.host}/ws-full`);
+        socket.binaryType = 'arraybuffer';
+
+        socket.onopen = () => {
+          status.textContent = '📥 Receiving audio data...';
+        };
+
+        socket.onmessage = async (event) => {
+          status.textContent = '🔊 Decoding and playing...';
+
+          // Convert received Int16Array to Float32Array
+          const int16 = new Int16Array(event.data);
+          const float32 = new Float32Array(int16.length);
+          for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0; // Normalize to [-1, 1]
+          }
+
+          // De-interleave stereo PCM
+          const channels = 2;
+          const length = float32.length / channels;
+          const audioBuffer = audioContext.createBuffer(channels, length, 44100);
+
+          const left = audioBuffer.getChannelData(0);
+          const right = audioBuffer.getChannelData(1);
+          for (let i = 0; i < length; i++) {
+            left[i] = float32[i * 2];
+            right[i] = float32[i * 2 + 1];
+          }
+
+          // Play with seamless loop
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.loop = true;
+          source.connect(audioContext.destination);
+          source.start();
+
+          status.textContent = '✅ Playing seamlessly (looping)';
+        };
+
+        socket.onerror = (err) => {
+          status.textContent = '❌ Connection error';
+          console.error('WebSocket error:', err);
+        };
+
+        socket.onclose = () => {
+          if (status.textContent !== '✅ Playing seamlessly (looping)') {
+            status.textContent = '🔌 Disconnected';
+          }
+        };
+      } catch (err) {
+        status.textContent = '💥 Error: ' + err.message;
+        console.error(err);
+      }
+    };
+  </script>
+</body>
+</html>
