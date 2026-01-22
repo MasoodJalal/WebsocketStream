@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+	"os"
+	"path/filepath"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -46,112 +48,65 @@ func wsFreeSwitchEcho(c echo.Context) error {
 	defer ws.Close()
 
 	log.Printf("New FreeSWITCH connection from %s", c.Request().RemoteAddr)
-
-	// Set read/write deadlines to prevent hanging connections
 	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
-	ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
+	// Generate unique session ID immediately
+	sessionID := "session_" + time.Now().Format("20060102_150405")
+	sessionDir := filepath.Join("recordings", sessionID)
+	os.MkdirAll(sessionDir, 0755)
+
+	fullPath := filepath.Join(sessionDir, "audio.raw")
+	fullFile, err := os.Create(fullPath)
+	if err != nil {
+		log.Printf("⚠️ Warning: cannot create %s: %v", fullPath, err)
+	} else {
+		log.Printf("🎙️ Recording audio to: %s", fullPath)
+		defer fullFile.Close()
+	}
+
+	currentSampleRate := 8000
 	messageCount := 0
-	currentSampleRate := 8000 // Default, will be updated from metadata
 
 	for {
-		// Reset read deadline on each message
 		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
-
 		messageType, message, err := ws.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			} else {
-				log.Printf("Connection closed normally")
-			}
 			break
 		}
 
-		messageCount++
-
 		switch messageType {
 		case websocket.TextMessage:
-			// Handle metadata or text messages from FreeSWITCH
-			log.Printf("Received text message: %s", string(message))
-
-			// Try to parse as metadata
-			var metadata StreamMetadata
-			if err := json.Unmarshal(message, &metadata); err == nil {
-				log.Printf("Stream metadata - CallID: %s, Caller: %s, SampleRate: %d, Channels: %d",
-					metadata.CallID, metadata.CallerNumber, metadata.SampleRate, metadata.Channels)
-
-				// Update current sample rate from metadata
-				if metadata.SampleRate > 0 {
-					currentSampleRate = metadata.SampleRate
-				}
-			}
-
-			// Send acknowledgment
-			response := map[string]interface{}{
-				"status":    "received",
-				"type":      "metadata",
-				"timestamp": time.Now().Unix(),
-			}
-			responseJSON, _ := json.Marshal(response)
-			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := ws.WriteMessage(websocket.TextMessage, responseJSON); err != nil {
-				log.Printf("Error sending text response: %v", err)
-				break
+			// Optional: parse metadata to update sample rate
+			var meta StreamMetadata
+			if json.Unmarshal(message, &meta) == nil && meta.SampleRate > 0 {
+				currentSampleRate = meta.SampleRate
 			}
 
 		case websocket.BinaryMessage:
-			// This is L16 audio data from FreeSWITCH
-			audioSize := len(message)
-
-			// Log every 100th message to avoid flooding
-			if messageCount%100 == 0 {
-				log.Printf("Received audio chunk #%d: %d bytes (will echo back via streamAudio)", messageCount, audioSize)
+			messageCount++
+			
+			// ✅ SAVE AUDIO HERE
+			if fullFile != nil {
+				fullFile.Write(message) // ignore error for speed
 			}
 
-			// Encode audio to base64
+			// Echo back
 			audioBase64 := base64.StdEncoding.EncodeToString(message)
-
-			// Create the streamAudio response in the format FreeSWITCH expects
-			streamResponse := StreamAudioResponse{
+			resp := StreamAudioResponse{
 				Type: "streamAudio",
 				Data: StreamAudioData{
-					AudioDataType: "raw", // L16 raw audio
+					AudioDataType: "raw",
 					SampleRate:    currentSampleRate,
 					AudioData:     audioBase64,
 				},
 			}
-
-			// Convert to JSON
-			responseJSON, err := json.Marshal(streamResponse)
-			if err != nil {
-				log.Printf("Error marshaling streamAudio response: %v", err)
-				continue
-			}
-
-			// Send the JSON response back to FreeSWITCH
-			// FreeSWITCH will decode the base64 audio and play it back to the caller
-			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := ws.WriteMessage(websocket.TextMessage, responseJSON); err != nil {
-				log.Printf("Error sending streamAudio response: %v", err)
-				break
-			}
-
-			// Optional: Send periodic status updates
-			if messageCount%200 == 0 {
-				statusMsg := map[string]interface{}{
-					"type":             "status",
-					"message":          "Processing audio",
-					"packets_received": messageCount,
-					"timestamp":        time.Now().Unix(),
-				}
-				statusJSON, _ := json.Marshal(statusMsg)
-				ws.WriteMessage(websocket.TextMessage, statusJSON)
+			if jsonBytes, _ := json.Marshal(resp); len(jsonBytes) > 0 {
+				ws.WriteMessage(websocket.TextMessage, jsonBytes)
 			}
 		}
 	}
 
-	log.Printf("Connection closed. Total messages processed: %d", messageCount)
+	log.Printf("CloseOperation. Saved %d chunks to %s", messageCount, fullPath)
 	return nil
 }
 
