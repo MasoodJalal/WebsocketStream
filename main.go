@@ -54,11 +54,12 @@ func wsFreeSwitchEcho(c echo.Context) error {
 	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 	// Generate unique session ID immediately
-	sessionID := "session_" + time.Now().Format("20060102_150405")
-	sessionDir := filepath.Join("recordings", sessionID)
-	os.MkdirAll(sessionDir, 0755)
+	recordingDir := "recordings"
+	os.MkdirAll(recordingDir, 0755)
 
-	fullPath := filepath.Join(sessionDir, "_audio.raw")
+	filename := "session_" + time.Now().Format("20060102_150405") + "_audio.raw"
+	fullPath := filepath.Join(recordingDir, filename)
+
 	fullFile, err := os.Create(fullPath)
 	if err != nil {
 		log.Printf("Warning: cannot create %s: %v", fullPath, err)
