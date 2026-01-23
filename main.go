@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"time"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -55,12 +58,12 @@ func wsFreeSwitchEcho(c echo.Context) error {
 	sessionDir := filepath.Join("recordings", sessionID)
 	os.MkdirAll(sessionDir, 0755)
 
-	fullPath := filepath.Join(sessionDir, "audio.raw")
+	fullPath := filepath.Join(sessionDir, "_audio.raw")
 	fullFile, err := os.Create(fullPath)
 	if err != nil {
-		log.Printf("⚠️ Warning: cannot create %s: %v", fullPath, err)
+		log.Printf("Warning: cannot create %s: %v", fullPath, err)
 	} else {
-		log.Printf("🎙️ Recording audio to: %s", fullPath)
+		log.Printf("Recording audio to: %s", fullPath)
 		defer fullFile.Close()
 	}
 
@@ -84,8 +87,7 @@ func wsFreeSwitchEcho(c echo.Context) error {
 
 		case websocket.BinaryMessage:
 			messageCount++
-			
-			// ✅ SAVE AUDIO HERE
+
 			if fullFile != nil {
 				fullFile.Write(message) // ignore error for speed
 			}
@@ -168,6 +170,161 @@ func wsFreeSwitchProcessed(c echo.Context) error {
 	return nil
 }
 
+type VoskResponse struct {
+	Success    bool   `json:"success"`
+	Transcript string `json:"transcript"`
+	SampleRate int    `json:"sample_rate"`
+}
+
+// Audio buffer for STT processing
+type AudioBuffer struct {
+	data       []byte
+	sampleRate int
+	lastSent   time.Time
+}
+
+var audioBuffers = make(map[string]*AudioBuffer)
+
+func wsFreeSwitchProcessedVoskSST(c echo.Context) error {
+	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	log.Printf("New FreeSWITCH processed audio connection from %s", c.Request().RemoteAddr)
+
+	currentSampleRate := 8000
+	sessionID := fmt.Sprintf("session_%d", time.Now().Unix())
+
+	// Initialize audio buffer for this session
+	audioBuffers[sessionID] = &AudioBuffer{
+		data:       make([]byte, 0),
+		sampleRate: currentSampleRate,
+		lastSent:   time.Now(),
+	}
+	defer delete(audioBuffers, sessionID)
+
+	for {
+		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		messageType, message, err := ws.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		switch messageType {
+		case websocket.TextMessage:
+			var metadata StreamMetadata
+			if err := json.Unmarshal(message, &metadata); err == nil {
+				if metadata.SampleRate > 0 {
+					currentSampleRate = metadata.SampleRate
+					audioBuffers[sessionID].sampleRate = currentSampleRate
+				}
+				log.Printf("Metadata received - SampleRate: %d", currentSampleRate)
+			}
+
+		case websocket.BinaryMessage:
+			// Add to buffer for STT processing
+			audioBuffers[sessionID].data = append(audioBuffers[sessionID].data, message...)
+
+			// Process every 3 seconds of audio
+			if time.Since(audioBuffers[sessionID].lastSent) >= 3*time.Second {
+				go processAudioChunk(sessionID, ws)
+				audioBuffers[sessionID].lastSent = time.Now()
+			}
+
+			// Original echo functionality
+			audioBase64 := base64.StdEncoding.EncodeToString(message)
+
+			streamResponse := StreamAudioResponse{
+				Type: "streamAudio",
+				Data: StreamAudioData{
+					AudioDataType: "raw",
+					SampleRate:    currentSampleRate,
+					AudioData:     audioBase64,
+				},
+			}
+
+			responseJSON, _ := json.Marshal(streamResponse)
+			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			ws.WriteMessage(websocket.TextMessage, responseJSON)
+		}
+	}
+
+	return nil
+}
+
+// NEW FUNCTION: Process audio chunk with Vosk STT
+func processAudioChunk(sessionID string, ws *websocket.Conn) {
+	buffer, exists := audioBuffers[sessionID]
+	if !exists || len(buffer.data) == 0 {
+		return
+	}
+
+	// Copy and clear buffer
+	audioData := make([]byte, len(buffer.data))
+	copy(audioData, buffer.data)
+	buffer.data = buffer.data[:0]
+
+	log.Printf("📤 Sending %d bytes to Vosk STT (sample rate: %d)", len(audioData), buffer.sampleRate)
+
+	// Send to Vosk
+	transcript, err := sendToVoskSTT(audioData, buffer.sampleRate)
+	if err != nil {
+		log.Printf("❌ STT Error: %v", err)
+		return
+	}
+
+	if transcript != "" {
+		log.Printf("📝 Transcript: %s", transcript)
+
+		// Optional: Send transcript back to FreeSWITCH as a JSON message
+		response := map[string]interface{}{
+			"type":       "transcript",
+			"text":       transcript,
+			"timestamp":  time.Now().Unix(),
+			"session_id": sessionID,
+		}
+		responseJSON, _ := json.Marshal(response)
+		ws.WriteMessage(websocket.TextMessage, responseJSON)
+	}
+}
+
+// NEW FUNCTION: Send audio to Vosk HTTP server
+func sendToVoskSTT(audioData []byte, sampleRate int) (string, error) {
+	url := fmt.Sprintf("http://localhost:5000/transcribe?sample_rate=%d", sampleRate)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(audioData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("vosk returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result VoskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if !result.Success {
+		return "", fmt.Errorf("vosk transcription failed")
+	}
+
+	return result.Transcript, nil
+}
+
 // Health check endpoint
 func healthCheck(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
@@ -189,9 +346,7 @@ func main() {
 	e.GET("/health", healthCheck)
 	e.GET("/ws-freeswitch", wsFreeSwitchEcho)
 	e.GET("/ws-processed", wsFreeSwitchProcessed)
-
-	// Optional: Serve static files if needed
-	// e.Static("/", "public")
+	e.GET("/ws-processed-vosk-sst", wsFreeSwitchProcessedVoskSST)
 
 	port := ":12000"
 	log.Printf("🎧 FreeSWITCH Echo Server running on http://localhost%s", port)
