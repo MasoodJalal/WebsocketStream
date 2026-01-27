@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/joho/godotenv"
+
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -572,6 +574,339 @@ func receiveElevenLabsTranscripts(ws *websocket.Conn, transcriptChan chan string
 	}
 }
 
+// ElevenLabs Conversational AI message types
+type ConvAIClientMessage struct {
+	Type                       string                      `json:"type,omitempty"`
+	UserAudioChunk             string                      `json:"user_audio_chunk,omitempty"`
+	EventID                    int64                       `json:"event_id,omitempty"`
+	ConversationConfigOverride *ConversationConfigOverride `json:"conversation_config_override,omitempty"`
+	CustomLLMExtraBody         map[string]interface{}      `json:"custom_llm_extra_body,omitempty"`
+	DynamicVariables           map[string]string           `json:"dynamic_variables,omitempty"`
+	ToolCallID                 string                      `json:"tool_call_id,omitempty"`
+	Result                     string                      `json:"result,omitempty"`
+	IsError                    bool                        `json:"is_error,omitempty"`
+	Text                       string                      `json:"text,omitempty"`
+}
+
+type ConversationConfigOverride struct {
+	Agent *AgentConfig `json:"agent,omitempty"`
+	TTS   *TTSConfig   `json:"tts,omitempty"`
+}
+
+type AgentConfig struct {
+	Prompt       *PromptConfig `json:"prompt,omitempty"`
+	FirstMessage string        `json:"first_message,omitempty"`
+	Language     string        `json:"language,omitempty"`
+}
+
+type PromptConfig struct {
+	Prompt string `json:"prompt,omitempty"`
+}
+
+type TTSConfig struct {
+	VoiceID string `json:"voice_id,omitempty"`
+}
+
+type ConvAIServerMessage struct {
+	Type                           string                       `json:"type"`
+	ConversationInitiationMetadata *ConversationInitMetadata    `json:"conversation_initiation_metadata_event,omitempty"`
+	UserTranscriptionEvent         *UserTranscriptionEvent      `json:"user_transcription_event,omitempty"`
+	AgentResponseEvent             *AgentResponseEvent          `json:"agent_response_event,omitempty"`
+	AudioEvent                     *AudioEvent                  `json:"audio_event,omitempty"`
+	PingEvent                      *PingEvent                   `json:"ping_event,omitempty"`
+	InterruptionEvent              *InterruptionEvent           `json:"interruption_event,omitempty"`
+	ClientToolCall                 *ClientToolCall              `json:"client_tool_call,omitempty"`
+	TentativeAgentResponseEvent    *TentativeAgentResponseEvent `json:"tentative_agent_response_internal_event,omitempty"`
+}
+
+type ConversationInitMetadata struct {
+	ConversationID         string `json:"conversation_id"`
+	AgentOutputAudioFormat string `json:"agent_output_audio_format"`
+	UserInputAudioFormat   string `json:"user_input_audio_format"`
+}
+
+type UserTranscriptionEvent struct {
+	UserTranscript string `json:"user_transcript"`
+}
+
+type AgentResponseEvent struct {
+	AgentResponse string `json:"agent_response"`
+}
+
+type AudioEvent struct {
+	AudioBase64 string `json:"audio_base_64"`
+	EventID     int    `json:"event_id"`
+}
+
+type PingEvent struct {
+	EventID int `json:"event_id"`
+	PingMs  int `json:"ping_ms"`
+}
+
+type InterruptionEvent struct {
+	EventID int `json:"event_id"`
+}
+
+type ClientToolCall struct {
+	ToolName   string                 `json:"tool_name"`
+	ToolCallID string                 `json:"tool_call_id"`
+	Parameters map[string]interface{} `json:"parameters"`
+}
+
+type TentativeAgentResponseEvent struct {
+	TentativeAgentResponse string `json:"tentative_agent_response"`
+}
+
+func wsFreeSwitchConversationalAI(c echo.Context) error {
+	// Get credentials from environment
+	apiKey := os.Getenv("ELEVENLABS_API_KEY")
+	agentID := os.Getenv("ELEVENLABS_AGENT_ID")
+
+	if apiKey == "" {
+		log.Println("❌ ELEVENLABS_API_KEY environment variable not set")
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": "ElevenLabs API key not configured",
+		})
+	}
+
+	if agentID == "" {
+		log.Println("❌ ELEVENLABS_AGENT_ID environment variable not set")
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error": "ElevenLabs Agent ID not configured",
+		})
+	}
+
+	// Upgrade FreeSWITCH connection
+	freeswitchWS, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		return err
+	}
+	defer freeswitchWS.Close()
+
+	sessionID := fmt.Sprintf("convai_%d", time.Now().Unix())
+	log.Printf("🤖 New FreeSWITCH -> ElevenLabs Conversational AI session: %s", sessionID)
+
+	// Connect to ElevenLabs Conversational AI WebSocket
+	convaiWS, err := connectToConversationalAI(apiKey, agentID, sessionID)
+	if err != nil {
+		log.Printf("❌ Failed to connect to ElevenLabs Conversational AI: %v", err)
+		return err
+	}
+	defer convaiWS.Close()
+
+	// Send initial conversation configuration (optional)
+	initMsg := ConvAIClientMessage{
+		Type: "conversation_initiation_client_data",
+		ConversationConfigOverride: &ConversationConfigOverride{
+			Agent: &AgentConfig{
+				Prompt: &PromptConfig{
+					Prompt: "You are a helpful and friendly customer support agent. Be concise and clear in your responses.",
+				},
+				FirstMessage: "Hello! How can I assist you today?",
+				Language:     "en",
+			},
+		},
+		CustomLLMExtraBody: map[string]interface{}{
+			"temperature": 0.7,
+			"max_tokens":  200,
+		},
+	}
+
+	if err := convaiWS.WriteJSON(initMsg); err != nil {
+		log.Printf("❌ Failed to send initialization message: %v", err)
+	}
+
+	// Channels for communication
+	agentAudioChan := make(chan []byte, 100)
+	errorChan := make(chan error, 1)
+	done := make(chan struct{})
+
+	// Goroutine to receive from ElevenLabs and send to FreeSWITCH
+	go receiveConversationalAI(convaiWS, freeswitchWS, agentAudioChan, errorChan, sessionID)
+
+	// Goroutine to send agent audio to FreeSWITCH
+	go func() {
+		currentSampleRate := 16000 // ElevenLabs typically uses 16kHz
+		for {
+			select {
+			case audioData, ok := <-agentAudioChan:
+				if !ok {
+					return
+				}
+
+				// Send agent's TTS audio back to FreeSWITCH
+				audioBase64 := base64.StdEncoding.EncodeToString(audioData)
+				resp := StreamAudioResponse{
+					Type: "streamAudio",
+					Data: StreamAudioData{
+						AudioDataType: "raw",
+						SampleRate:    currentSampleRate,
+						AudioData:     audioBase64,
+					},
+				}
+
+				respJSON, _ := json.Marshal(resp)
+				if err := freeswitchWS.WriteMessage(websocket.TextMessage, respJSON); err != nil {
+					log.Printf("⚠️ [%s] Failed to send audio to FreeSWITCH: %v", sessionID, err)
+				}
+
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Main loop: Read from FreeSWITCH and send to ElevenLabs
+	currentSampleRate := 8000
+	messageCount := 0
+
+	for {
+		freeswitchWS.SetReadDeadline(time.Now().Add(60 * time.Second))
+		messageType, message, err := freeswitchWS.ReadMessage()
+		if err != nil {
+			log.Printf("⚠️ [%s] FreeSWITCH connection closed: %v", sessionID, err)
+			close(done)
+			break
+		}
+
+		switch messageType {
+		case websocket.TextMessage:
+			// Handle metadata from FreeSWITCH
+			var meta StreamMetadata
+			if json.Unmarshal(message, &meta) == nil && meta.SampleRate > 0 {
+				currentSampleRate = meta.SampleRate
+				log.Printf("📊 [%s] Sample rate: %d Hz", sessionID, currentSampleRate)
+			}
+
+		case websocket.BinaryMessage:
+			messageCount++
+
+			// Send user audio to ElevenLabs Conversational AI
+			audioBase64 := base64.StdEncoding.EncodeToString(message)
+
+			audioMsg := ConvAIClientMessage{
+				UserAudioChunk: audioBase64,
+			}
+
+			if err := convaiWS.WriteJSON(audioMsg); err != nil {
+				log.Printf("❌ [%s] Failed to send audio to ConvAI: %v", sessionID, err)
+				continue
+			}
+
+			if messageCount%100 == 0 {
+				log.Printf("📡 [%s] Processed %d audio chunks", sessionID, messageCount)
+			}
+		}
+	}
+
+	log.Printf("✅ [%s] Session ended. Processed %d audio chunks", sessionID, messageCount)
+	return nil
+}
+
+// Connect to ElevenLabs Conversational AI WebSocket
+func connectToConversationalAI(apiKey, agentID, sessionID string) (*websocket.Conn, error) {
+	url := fmt.Sprintf("wss://api.elevenlabs.io/v1/convai/conversation?agent_id=%s", agentID)
+
+	headers := http.Header{}
+	headers.Add("xi-api-key", apiKey)
+
+	log.Printf("🔌 [%s] Connecting to ElevenLabs Conversational AI...", sessionID)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, headers)
+	if err != nil {
+		if resp != nil {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("failed to connect: %v, response: %s", err, string(body))
+		}
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	log.Printf("✅ [%s] Connected to ElevenLabs Conversational AI", sessionID)
+	return conn, nil
+}
+
+// Receive messages from ElevenLabs Conversational AI
+func receiveConversationalAI(convaiWS, freeswitchWS *websocket.Conn, agentAudioChan chan []byte, errorChan chan error, sessionID string) {
+	defer close(agentAudioChan)
+
+	for {
+		var msg ConvAIServerMessage
+		if err := convaiWS.ReadJSON(&msg); err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("ℹ️ [%s] ConvAI connection closed normally", sessionID)
+			} else {
+				log.Printf("❌ [%s] Error reading from ConvAI: %v", sessionID, err)
+				errorChan <- err
+			}
+			return
+		}
+
+		switch msg.Type {
+		case "conversation_initiation_metadata":
+			if msg.ConversationInitiationMetadata != nil {
+				log.Printf("✅ [%s] Conversation started: %s", sessionID, msg.ConversationInitiationMetadata.ConversationID)
+				log.Printf("   Audio format: %s -> %s",
+					msg.ConversationInitiationMetadata.UserInputAudioFormat,
+					msg.ConversationInitiationMetadata.AgentOutputAudioFormat)
+			}
+
+		case "user_transcript":
+			if msg.UserTranscriptionEvent != nil {
+				log.Printf("👤 [%s] User said: %s", sessionID, msg.UserTranscriptionEvent.UserTranscript)
+			}
+
+		case "agent_response":
+			if msg.AgentResponseEvent != nil {
+				log.Printf("🤖 [%s] Agent response: %s", sessionID, msg.AgentResponseEvent.AgentResponse)
+			}
+
+		case "internal_tentative_agent_response":
+			if msg.TentativeAgentResponseEvent != nil {
+				log.Printf("💭 [%s] Agent thinking: %s", sessionID, msg.TentativeAgentResponseEvent.TentativeAgentResponse)
+			}
+
+		case "audio":
+			if msg.AudioEvent != nil {
+				// Decode base64 audio from agent
+				audioData, err := base64.StdEncoding.DecodeString(msg.AudioEvent.AudioBase64)
+				if err != nil {
+					log.Printf("❌ [%s] Failed to decode audio: %v", sessionID, err)
+					continue
+				}
+
+				// Send to channel for FreeSWITCH playback
+				agentAudioChan <- audioData
+			}
+
+		case "interruption":
+			if msg.InterruptionEvent != nil {
+				log.Printf("⚠️ [%s] User interrupted agent", sessionID)
+			}
+
+		case "ping":
+			if msg.PingEvent != nil {
+				// Respond with pong
+				pongMsg := ConvAIClientMessage{
+					Type:    "pong",
+					EventID: int64(msg.PingEvent.EventID),
+				}
+				convaiWS.WriteJSON(pongMsg)
+			}
+
+		case "client_tool_call":
+			if msg.ClientToolCall != nil {
+				log.Printf("🔧 [%s] Tool call: %s (ID: %s)", sessionID, msg.ClientToolCall.ToolName, msg.ClientToolCall.ToolCallID)
+				// You can implement tool calling here if needed
+			}
+
+		default:
+			// Log unknown message types
+			if msg.Type != "" {
+				log.Printf("🔍 [%s] Unknown message type: %s", sessionID, msg.Type)
+			}
+		}
+	}
+}
+
 // Health check endpoint
 func healthCheck(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
@@ -582,6 +917,11 @@ func healthCheck(c echo.Context) error {
 }
 
 func main() {
+
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️ No .env file found, using system environment variables")
+	}
+
 	e := echo.New()
 
 	// Middleware
@@ -598,13 +938,16 @@ func main() {
 	// NEW ROUTE: ElevenLabs STT
 	e.GET("/ws-elevenlabs-stt", wsFreeSwitchElevenLabsSTT)
 
+	e.GET("/ws-conversational-ai", wsFreeSwitchConversationalAI)
+
 	port := ":12000"
 	log.Printf("🎧 FreeSWITCH Echo Server running on http://localhost%s", port)
 	log.Printf("WebSocket endpoints:")
 	log.Printf("  - ws://localhost%s/ws-freeswitch (Echo only)", port)
 	log.Printf("  - ws://localhost%s/ws-processed (Basic processing)", port)
 	log.Printf("  - ws://localhost%s/ws-processed-vosk-sst (Vosk STT)", port)
-	log.Printf("  - ws://localhost%s/ws-elevenlabs-stt (ElevenLabs STT) ⭐ NEW", port)
+	log.Printf("  - ws://localhost%s/ws-elevenlabs-stt (ElevenLabs STT) TTS only", port)
+	log.Printf("  - ws://localhost%s/ws-conversational-ai (ElevenLabs Full AI Agent)", port)
 	log.Println("Ready to receive L16 audio streams from FreeSWITCH")
 
 	e.Logger.Fatal(e.Start(port))
