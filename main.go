@@ -115,60 +115,71 @@ func wsFreeSwitchEcho(c echo.Context) error {
 
 // Example: Advanced handler that could process audio before echoing
 func wsFreeSwitchProcessed(c echo.Context) error {
-	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
-	if err != nil {
-		return err
-	}
-	defer ws.Close()
+    ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+    if err != nil {
+        return err
+    }
+    defer ws.Close()
 
-	log.Printf("New FreeSWITCH processed audio connection from %s", c.Request().RemoteAddr)
+    log.Printf("New FreeSWITCH processed audio connection from %s", c.Request().RemoteAddr)
 
-	currentSampleRate := 8000
+    currentSampleRate := 8000
+    sessionID := fmt.Sprintf("session_%d", time.Now().Unix())
+    
+    // Initialize audio buffer - INCREASED TO 5 SECONDS
+    audioBuffers[sessionID] = &AudioBuffer{
+        data:       make([]byte, 0),
+        sampleRate: currentSampleRate,
+        lastSent:   time.Now(),
+    }
+    defer delete(audioBuffers, sessionID)
 
-	for {
-		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+    for {
+        ws.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-		messageType, message, err := ws.ReadMessage()
-		if err != nil {
-			break
-		}
+        messageType, message, err := ws.ReadMessage()
+        if err != nil {
+            break
+        }
 
-		switch messageType {
-		case websocket.TextMessage:
-			var metadata StreamMetadata
-			if err := json.Unmarshal(message, &metadata); err == nil {
-				if metadata.SampleRate > 0 {
-					currentSampleRate = metadata.SampleRate
-				}
-				log.Printf("Metadata received - SampleRate: %d", currentSampleRate)
-			}
+        switch messageType {
+        case websocket.TextMessage:
+            var metadata StreamMetadata
+            if err := json.Unmarshal(message, &metadata); err == nil {
+                if metadata.SampleRate > 0 {
+                    currentSampleRate = metadata.SampleRate
+                    audioBuffers[sessionID].sampleRate = currentSampleRate
+                }
+                log.Printf("Metadata received - SampleRate: %d", currentSampleRate)
+            }
 
-		case websocket.BinaryMessage:
-			// Here you could:
-			// 1. Send audio to ASR service (Google Speech, Watson, etc.)
-			// 2. Process the audio (noise reduction, volume adjustment, etc.)
-			// 3. Generate response audio from TTS
-			// 4. Send processed audio back
+        case websocket.BinaryMessage:
+            // ECHO FIRST - NO GAPS IN PLAYBACK
+            audioBase64 := base64.StdEncoding.EncodeToString(message)
+            streamResponse := StreamAudioResponse{
+                Type: "streamAudio",
+                Data: StreamAudioData{
+                    AudioDataType: "raw",
+                    SampleRate:    currentSampleRate,
+                    AudioData:     audioBase64,
+                },
+            }
+            responseJSON, _ := json.Marshal(streamResponse)
+            ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+            ws.WriteMessage(websocket.TextMessage, responseJSON)
 
-			// For now, just echo with the proper format
-			audioBase64 := base64.StdEncoding.EncodeToString(message)
+            // THEN buffer for STT (doesn't block echo)
+            audioBuffers[sessionID].data = append(audioBuffers[sessionID].data, message...)
+            
+            // Process every 5 seconds (more audio = better recognition)
+            if time.Since(audioBuffers[sessionID].lastSent) >= 5*time.Second {
+                go processAudioChunk(sessionID, ws)
+                audioBuffers[sessionID].lastSent = time.Now()
+            }
+        }
+    }
 
-			streamResponse := StreamAudioResponse{
-				Type: "streamAudio",
-				Data: StreamAudioData{
-					AudioDataType: "raw",
-					SampleRate:    currentSampleRate,
-					AudioData:     audioBase64,
-				},
-			}
-
-			responseJSON, _ := json.Marshal(streamResponse)
-			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			ws.WriteMessage(websocket.TextMessage, responseJSON)
-		}
-	}
-
-	return nil
+    return nil
 }
 
 type VoskResponse struct {
